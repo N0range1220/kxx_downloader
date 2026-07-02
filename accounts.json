@@ -1,0 +1,16 @@
+{
+  "_comment": "kxx.moe 多账号配置文件。请按下方格式填入 email / password。download_dir 可选,留空则使用脚本目录下的 downloads/。",
+  "_comment2": "至少需要 1 个账号才能下载;额度耗尽时会自动切换到下一个账号。",
+  "accounts": [
+    {
+      "email": "your_email_1@example.com",
+      "password": "your_password_1",
+      "download_dir": ""
+    },
+    {
+      "email": "your_email_2@example.com",
+      "password": "your_password_2",
+      "download_dir": ""
+    }
+  ]
+}
