@@ -123,6 +123,85 @@ class KxxClient:
         self.logged_in = False
         # 额度读写锁 (并发下载时保护 quota_now)
         self.quota_lock = threading.Lock()
+        # cookie 缓存目录 (ensure_login 时设置)
+        self._session_dir = ".kxx_sessions"
+
+    # ----- 会话持久化 (cookie 缓存) -----
+    def session_path(self, session_dir: str = ".kxx_sessions") -> Path:
+        """每个账号一个 cookie 缓存文件, 按 email 命名."""
+        safe_email = re.sub(r'[^A-Za-z0-9_.@-]', '_', self.email)
+        return Path(session_dir) / f"session_{safe_email}.json"
+
+    def save_session(self, session_dir: str = ".kxx_sessions") -> None:
+        """保存 cookie + 关键状态到磁盘, 下次启动直接复用, 跳过登录."""
+        try:
+            p = self.session_path(session_dir)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            cookies = self.s.cookies.get_dict()
+            data = {
+                "email": self.email,
+                "cookies": cookies,
+                "uin": self.uin,
+                "is_vip": self.is_vip,
+                "use_downview": self.use_downview,
+                "quota_now": self.quota_now,
+                "quota_used": self.quota_used,
+                "saved_at": time.time(),
+            }
+            p.write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                         encoding="utf-8")
+        except Exception:
+            pass  # 缓存写入失败不影响主流程
+
+    def load_session(self, session_dir: str = ".kxx_sessions",
+                     max_age_days: float = 7.0) -> bool:
+        """加载并恢复 cookie. 返回 True 表示成功恢复 (还需后续请求验证有效性)."""
+        p = self.session_path(session_dir)
+        if not p.exists():
+            return False
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            return False
+        # 过期判定 (cookie 一般 23 天, 这里更保守用 7 天)
+        if time.time() - data.get("saved_at", 0) > max_age_days * 86400:
+            return False
+        cookies = data.get("cookies") or {}
+        if not cookies:
+            return False
+        # 恢复 cookie 到 session
+        self.s.cookies.update(cookies)
+        self.uin = data.get("uin", "")
+        self.is_vip = data.get("is_vip", 0)
+        self.use_downview = data.get("use_downview", 0)
+        self.quota_now = data.get("quota_now", 0.0)
+        self.quota_used = data.get("quota_used", 0.0)
+        return True
+
+    def clear_session(self, session_dir: str = ".kxx_sessions") -> None:
+        p = self.session_path(session_dir)
+        try:
+            p.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    def is_logged_in_remote(self, book_code: str = "") -> bool:
+        """通过拉取书籍页检查服务端是否还认这个 cookie.
+
+        判据: uin 字段非空 (匿名访问时 uin 为空字符串).
+        """
+        try:
+            code = book_code or "00000"  # 任意合法短码都行, 主要看 uin
+            # 实际下载时主流程会调 fetch_book, 这里单独检查就走一个轻量请求
+            r = self._get("/")
+            text = r.text
+            m = re.search(r'var\s+uin\s*=\s*"([^"]*)"', text)
+            if m and m.group(1):
+                self.uin = m.group(1)
+                return True
+        except Exception:
+            pass
+        return False
 
     # ----- HTTP helpers -----
     def _get(self, path: str, params=None, headers=None, stream=False, allow_redirects=True):
@@ -163,6 +242,27 @@ class KxxClient:
         # 3) 验证登录态: 拉 / 并检查 uin 是否填充
         self._get("/")
         self.logged_in = True
+        # 4) 持久化 cookie, 下次启动可跳过登录
+        self.save_session(self._session_dir)
+
+    def ensure_login(self, session_dir: str = ".kxx_sessions",
+                     force_refresh: bool = False) -> str:
+        """优先复用本地 cookie; 失效时才真正登录.
+
+        返回:
+          "cached"  — 复用了缓存 cookie, 未实际登录
+          "login"   — 缓存不存在或失效, 重新登录成功
+        """
+        self._session_dir = session_dir
+        if not force_refresh and self.load_session(session_dir):
+            # 有缓存, 验证一下是否还有效 (拉首页看 uin)
+            if self.is_logged_in_remote():
+                self.logged_in = True
+                return "cached"
+            # 缓存失效, 清掉重登
+            self.clear_session(session_dir)
+        self.login()
+        return "login"
 
     # ----- 书籍页解析 -----
     def _parse_book_html(self, html: str) -> dict:
@@ -565,6 +665,14 @@ def main():
     ap.add_argument("--no-concurrent", action="store_true",
                     help="禁用并发, 顺序下载 (相当于 --workers 1)")
 
+    # 会话持久化
+    ap.add_argument("--session-dir", default=".kxx_sessions",
+                    help="cookie 缓存目录 (默认 ./.kxx_sessions)")
+    ap.add_argument("--no-session", action="store_true",
+                    help="禁用 cookie 缓存, 每次都重新登录")
+    ap.add_argument("--refresh-session", action="store_true",
+                    help="强制重新登录并刷新 cookie (cookie 异常时用)")
+
     args = ap.parse_args()
 
     # 默认格式 mobi
@@ -595,6 +703,7 @@ def main():
         log(f"[*] 代理池大小: {len(proxies_pool)} (将按账号索引循环分配)")
 
     # 4) 登录所有账号 (顺序登录, 避免并发登录触发风控)
+    #    优先复用本地 cookie 缓存, 失效才真正登录
     clients = []  # list of (client_idx, acc_dict, KxxClient)
     for i, acc in enumerate(accounts):
         # 决定该账号用的代理
@@ -604,9 +713,14 @@ def main():
             proxy = acc.get("proxy", "")
         c = KxxClient(acc["email"], acc["password"], proxy=proxy)
         try:
-            c.login()
+            if args.no_session:
+                c.login()
+                how = "登录"
+            else:
+                how = c.ensure_login(args.session_dir, force_refresh=args.refresh_session)
+                how = "复用缓存" if how == "cached" else "登录"
             tag = f" via {proxy}" if proxy else ""
-            log(f"[+] 账号登录成功: {acc['email']}{tag}")
+            log(f"[+] 账号{how}成功: {acc['email']}{tag}")
             clients.append((i, acc, c))
         except Exception as e:
             tag = f" (proxy={proxy})" if proxy else ""
@@ -637,7 +751,20 @@ def main():
         volumes = primary_c.fetch_volumes(info["book_data_h"])
     log(f"[*] 共 {len(volumes)} 卷")
 
-    # 6) 打印各账号初始额度
+    # 6) 让每个账号都拉一次书籍页, 同步各自的服务端额度 (否则后续下载时
+    #    只有主账号 quota_now 被填充, 其他账号还是 0, pick_client_for_quota
+    #    会误判"全部账号额度不足")
+    if len(clients) > 1:
+        log("[*] 同步各账号额度...")
+        for i, acc, c in clients:
+            if i == 0:  # 主账号已在上面拉过
+                continue
+            try:
+                c.fetch_book(book_code)
+            except Exception as e:
+                log(f"[!] 账号 {acc['email']} 额度同步失败: {e}")
+
+    # 打印各账号初始额度
     for _, acc, c in clients:
         log(f"[*] 账号 {acc['email']} 初始额度: {fmt_size_mb(c.get_quota())}")
 
